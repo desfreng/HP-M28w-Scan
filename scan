@@ -1,0 +1,369 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+import argparse
+import xml.etree.ElementTree as Et
+from pathlib import Path
+from re import match, search
+from sys import exit, stderr, stdout
+
+import requests
+from math import ceil
+
+set_log = False
+
+
+def log(msg):
+    if set_log:
+        print(msg)
+
+
+class Scanner:
+    def __init__(self, ip):
+        self._url = "http://" + ip + ":8080/eSCL/"
+        self._ns = {"scan": "http://schemas.hp.com/imaging/escl/2011/05/03",
+                    "pwg": "http://www.pwg.org/schemas/2010/12/sm"}
+        self._col_mod = []
+        self._res = []
+        self._doc_frm = []
+        self._max_size = ()
+        self._min_size = ()
+
+        self._admin_url = ""
+        self._name = ""
+        self._serial_number = ""
+
+        self._update_capacity()
+
+        self._job_id = None
+        self._job_dl = None
+
+    @property
+    def job_age(self):
+        if self._job_id is None:
+            return 0
+
+        r = requests.get(self._url + "ScannerStatus")
+        xml_result = Et.fromstring(r.text)
+
+        for a in xml_result.findall(".//scan:JobInfo", self._ns):
+            if a.find("pwg:JobUuid", self._ns).text == self._job_id:
+                return int(a.find("scan:Age", self._ns).text)
+
+    @property
+    def job_ended(self):
+        if self._job_id is None:
+            return False
+
+        r = requests.get(self._url + "ScannerStatus")
+        xml_result = Et.fromstring(r.text)
+
+        for a in xml_result.findall(".//scan:JobInfo", self._ns):
+            if a.find("pwg:JobUuid", self._ns).text == self._job_id:
+                return int(a.find("pwg:ImagesToTransfer", self._ns).text) > 0
+        return False
+
+    def _update_capacity(self):
+        r = requests.get(self._url + "ScannerCapabilities")
+        xml_result = Et.fromstring(r.text)
+
+        self._col_mod.clear()
+        for a in xml_result.findall(".//scan:ColorMode", self._ns):
+            self._col_mod.append(a.text)
+
+        self._res.clear()
+        for a in xml_result.findall(".//scan:DiscreteResolution", self._ns):
+            x_res = int(a.find("scan:XResolution", self._ns).text)
+            y_res = int(a.find("scan:YResolution", self._ns).text)
+            self._res.append((x_res, y_res))
+
+        self._doc_frm.clear()
+        for a in xml_result.findall(".//scan:DocumentFormatExt", self._ns):
+            self._doc_frm.append(a.text)
+
+        min_x = int(xml_result.find(".//scan:MinWidth", self._ns).text)
+        min_y = int(xml_result.find(".//scan:MinHeight", self._ns).text)
+        self._min_size = (min_x, min_y)
+
+        max_x = int(xml_result.find(".//scan:MaxWidth", self._ns).text)
+        max_y = int(xml_result.find(".//scan:MaxHeight", self._ns).text)
+        self._max_size = (max_x, max_y)
+
+        self._admin_url = xml_result.find(".//scan:AdminURI", self._ns).text
+        self._name = xml_result.find(".//pwg:MakeAndModel", self._ns).text
+        self._serial_number = xml_result.find(".//pwg:SerialNumber", self._ns).text
+
+    @property
+    def admin_url(self):
+        return self._admin_url
+
+    @property
+    def name(self):
+        return self._name
+
+    @property
+    def serial_number(self):
+        return self._serial_number
+
+    def scanning(self):
+        return self.state == "Processing"
+
+    def idle(self):
+        return self.state == "Idle"
+
+    @property
+    def state(self):
+        r = requests.get(self._url + "ScannerStatus")
+        status_xml = Et.fromstring(r.text)
+        return status_xml.find(".//pwg:State", self._ns).text
+
+    @property
+    def color_modes(self):
+        return self._col_mod
+
+    @property
+    def resolutions(self):
+        return self._res
+
+    @property
+    def scan_format(self):
+        return self._doc_frm
+
+    @property
+    def max_size(self):
+        return self._max_size
+
+    @property
+    def min_size(self):
+        return self._min_size
+
+    def scan_request(self, x, y, width, height, doc_format, x_res, y_res, color_mode):
+        command = """<?xml version='1.0' encoding='utf-8'?>
+        <escl:ScanSettings xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:pwg="http://www.pwg.org/schemas/2010/12/sm" xmlns:escl="http://schemas.hp.com/imaging/escl/2011/05/03">
+        <pwg:Version>2.63</pwg:Version>
+            <pwg:ScanRegions pwg:MustHonor="false">
+                <pwg:ScanRegion>
+                    <pwg:ContentRegionUnits>escl:ThreeHundredthsOfInches</pwg:ContentRegionUnits>
+                    <pwg:XOffset>{}</pwg:XOffset>
+                    <pwg:YOffset>{}</pwg:YOffset>
+                    <pwg:Width>{}</pwg:Width>
+                    <pwg:Height>{}</pwg:Height>
+                </pwg:ScanRegion>
+            </pwg:ScanRegions>
+            <escl:DocumentFormatExt>{}</escl:DocumentFormatExt>
+            <pwg:InputSource>Platen</pwg:InputSource>
+            <escl:XResolution>{}</escl:XResolution>
+            <escl:YResolution>{}</escl:YResolution>
+            <escl:ColorMode>{}</escl:ColorMode>
+        </escl:ScanSettings>""".format(x, y, width, height, doc_format, x_res, y_res, color_mode)
+
+        r = requests.post(self._url + "ScanJobs", data=command.encode(), headers={'content-type': 'text/xml'})
+
+        if r.status_code == 201:
+            self._job_id = search(r"http://.*:80/eSCL/ScanJobs/([a-z0-9-]*)", r.headers['Location']).group(1)
+            self._job_dl = r.headers['Location'] + "/NextDocument"
+        else:
+            raise Exception("Scanner Unavailable")
+
+    def get_file(self):
+        if not self.job_ended:
+            return
+
+        r = requests.get(self._job_dl)
+        self._job_id = None
+        self._job_dl = None
+        return bytes(r.content)
+
+
+parser = argparse.ArgumentParser()
+
+parser.add_argument("ip", type=str)
+parser.add_argument("filename", type=str, nargs='?', default=None)
+
+parser.add_argument("-f", "--format", choices=['A4', 'A5', 'Letter'], help="Set scan format (Default : A4)",
+                    default="A4")
+parser.add_argument("-W", "--width", type=float, help="Set scan width in cm (Default : 21 cm)", default=21)
+parser.add_argument("-H", "--height", type=float, help="Set scan height in cm (Default : 29.7 cm)", default=29.7)
+parser.add_argument("-d", "--dpi", type=int, help="Select scan resolution in dpi", default=600)
+
+out = parser.add_mutually_exclusive_group(required=False)
+out.add_argument("-p", "--pdf", action="store_true", help="Set output as a PDF file")
+out.add_argument("-j", "--jpeg", action="store_true", help="Set output as a JPEG file")
+out.add_argument("-r", "--raw", action="store_true", help="Set output as a RAW file")
+
+col = parser.add_mutually_exclusive_group()
+col.add_argument("-c", "--color", action="store_true", help="Scan in color mode (Default Color Mode)", default=True)
+col.add_argument("-g", "--gray", action="store_true", help="Scan in gray scale mode")
+
+parser.add_argument("-i", "--info", action="store_true", help="Print scanner info's")
+parser.add_argument("-v", "--verbose", action="store_true", help="Show logs & info")
+
+args = parser.parse_args()
+
+set_log = args.verbose
+
+if not match('[1-2]?[0-9]{1,2}\.[1-2]?[0-9]{1,2}\.[1-2]?[0-9]{1,2}\.[1-2]?[0-9]{1,2}', args.ip):
+    stderr.write("Error : This is not a IP Address !"
+                 "Please enter a correct IP following the IPv4 pattern : xxx.xxx.xxx.xxx")
+    exit(1)
+
+scan = Scanner(args.ip)
+
+if args.info:
+    scanner_info = "Scanner Info's :\n" \
+                   "    Model :               {}\n" \
+                   "    Serial Number :       {}\n" \
+                   "    Admin Url :           {}\n".format(scan.name, scan.serial_number, scan.admin_url)
+
+    scanner_capacity = "Scanner Capacity :\n" \
+                       "    Minimum scan size :   {}\n" \
+                       "    Maximum scan size :   {}\n" \
+                       "    Color Modes :         {}\n" \
+                       "    Resolutions :         {}\n".format((scan.min_size[0], scan.min_size[1]),
+                                                               (scan.max_size[0], scan.max_size[1]),
+                                                               ", ".join(scan.color_modes),
+                                                               ", ".join(map(str, scan.resolutions)))
+    output = "Output Format :\n" \
+             "      PDF :               {}\n" \
+             "      JPEG :              {}\n" \
+             "      Raw :               {}\n".format('Yes' if 'application/pdf' in scan.scan_format else 'No',
+                                                       'Yes' if 'image/jpeg' in scan.scan_format else 'No',
+                                                       'Yes' if 'application/octet-stream' in scan.scan_format else 'No')
+
+    stdout.write(scanner_info + '\n' + scanner_capacity + '\n' + output)
+    exit(0)
+
+out_format = None
+ext_file = None
+if args.pdf:
+    out_format = "application/pdf"
+    ext_file = ".pdf"
+    log("Set PDF Output")
+elif args.jpeg:
+    out_format = "image/jpeg"
+    ext_file = ".jpg"
+    log("Set JPG Output")
+elif args.raw:
+    out_format = "application/octet-stream"
+    ext_file = ".raw"
+    log("Set RAW Output")
+else:
+    if args.filename is None:
+        out_format = "image/jpeg"
+        ext_file = ".jpg"
+        log("Unable to detect output format. Falling back in JPG.")
+    elif Path(args.filename).suffix == ".jpg" or Path(args.filename).suffix == ".jpeg":
+        out_format = "image/jpeg"
+        log("Detected output : JPG format")
+
+    elif Path(args.filename).suffix == ".pdf":
+        out_format = "application/pdf"
+        log("Detected output : PDF format")
+
+    elif Path(args.filename).suffix == ".raw":
+        out_format = "application/octet-stream"
+        log("Detected output : RAW format")
+
+filename = None
+if args.filename is None:
+    log("No filename specified. Creating one...")
+
+    file = "scan-{}" + ext_file
+    file_id = 0
+
+    pt = Path(file.format(file_id))
+    while pt.exists():
+        file_id += 1
+        pt = Path(file.format(file_id))
+
+    filename = file.format(file_id)
+else:
+    filename = args.filename
+
+log("Filename set to : {}".format(filename))
+
+if args.gray:
+    color = [x for x in scan.color_modes if 'gray' in x.lower()][0]
+else:
+    color = [x for x in scan.color_modes if 'rgb' in x.lower()][0]
+
+log("Selected color mode : {}".format(color))
+
+dpi_final = None
+if (args.dpi, args.dpi) not in scan.resolutions:
+    log("Unable to use selected dpi resolution. Falling back to the nearest supported.")
+
+    dist = 9999999999
+    for a in scan.resolutions:
+        if abs(a[0] - args.dpi) <= dist:
+            dpi_final = a[0]
+            dist = abs(a[0] - args.dpi)
+else:
+    dpi_final = args.dpi
+
+log("Selected resolution : {}".format(dpi_final))
+
+scan_x = 0
+scan_y = 0
+
+calc_dpi = dpi_final
+
+if calc_dpi > 300:
+    calc_dpi = 300
+
+if args.format == 'A4' and (args.width != 21 or args.height != 29.7):
+    log("Special Height and Width given. Ignoring format option.")
+    scan_x = ceil(calc_dpi * (args.width / 2.54))
+    scan_y = ceil(calc_dpi * (args.height / 2.54))
+    log("Scan zone set to {}px x {}px ({}cm x {}cm)".format(scan_x, scan_y, args.width, args.height))
+
+elif args.format == 'A4':
+    scan_x = ceil(calc_dpi * (21 / 2.54))
+    scan_y = ceil(calc_dpi * (29.7 / 2.54))
+    log("Scan zone set to {}px x {}px (A4 format)".format(scan_x, scan_y))
+
+elif args.format == 'A5':
+    scan_x = ceil(calc_dpi * (14.8 / 2.54))
+    scan_y = ceil(calc_dpi * (21 / 2.54))
+    log("Scan zone set to {}px x {}px (A5 format)".format(scan_x, scan_y))
+
+elif args.format == 'Letter':
+    scan_x = ceil(calc_dpi * 11)
+    scan_y = ceil(calc_dpi * 8.5)
+    log("Scan zone set to {}px x {}px (Letter format)".format(scan_x, scan_y))
+
+if scan_x > scan.max_size[0]:
+    scan_x = scan.max_size[0]
+    log("Size to large ! Falling back to {}px x {}px".format(scan_x, scan_y))
+
+if scan_y > scan.max_size[1]:
+    scan_y = scan.max_size[1]
+    log("Size to large ! Falling back to {}px x {}px".format(scan_x, scan_y))
+
+if scan_x < scan.min_size[0]:
+    scan_x = scan.min_size[0]
+    log("Size to small ! Falling back to {}px x {}px".format(scan_x, scan_y))
+
+if scan_y < scan.min_size[1]:
+    scan_y = scan.min_size[1]
+    log("Size to small ! Falling back to {}px x {}px".format(scan_x, scan_y))
+
+scan.scan_request(0, 0, scan_x, scan_y, out_format, dpi_final, dpi_final, color)
+
+while not scan.job_ended:
+    print('Scanning.    (Job Age : {})'.format(scan.job_age), end='\r')
+    print('Scanning..   (Job Age : {})'.format(scan.job_age), end='\r')
+    print('Scanning...  (Job Age : {})'.format(scan.job_age), end='\r')
+    print('Scanning..   (Job Age : {})'.format(scan.job_age), end='\r')
+
+save = scan.get_file()
+
+out_pipe = None
+if filename == '-':
+    out_pipe = stdout
+else:
+    out_pipe = open(filename, 'wb')
+
+out_pipe.write(save)
+out_pipe.close()
+
+print("\nJob Ended !")
